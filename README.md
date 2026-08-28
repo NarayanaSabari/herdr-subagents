@@ -3,9 +3,21 @@
 Async subagents for [pi](https://github.com/badlogic/pi-mono), running in
 [herdr](https://github.com/herdrdev/herdr) panes.
 
-`subagent()` returns immediately. The child runs in its own herdr pane, and when
-it finishes its result is injected back into the parent conversation. The parent
-keeps working in the meantime.
+`subagent()` runs a task in a sandboxed child pi, in its own herdr pane, and
+returns its report. Issue several calls in one turn and they run concurrently.
+
+```
++------------------+------------------+
+|                  |   scout (a)      |
+|      MAIN        +------------------+
+|      50%         |   scout (b)      |
+|                  +------------------+
+|                  |   scout (c)      |
++------------------+------------------+
+```
+
+Main keeps its half however many subagents run; they stack in the right column
+and their panes close as they finish, so main reclaims the full width.
 
 ## Why herdr
 
@@ -135,14 +147,36 @@ is exact and complete at any length.
 That is why the agent body ends with an instruction that the final message *is*
 the report. The caller sees that message and nothing else.
 
+## Blocking, and why
+
+`subagent` blocks until its child finishes. The first version did not: it
+returned immediately and delivered results later through `pi.sendMessage`. In
+real use the main agent simply answered first, while three subagents were still
+working, so its answer was written without the evidence it had asked for.
+
+Blocking removes that by construction instead of asking the model to remember
+to wait. Parallelism is unaffected - several `subagent` calls in one assistant
+turn execute concurrently, and the turn cannot end until all of them return.
+
+While they run, a widget above the editor shows what is happening:
+
+```
+╭─ Subagents ──────────────────────────── 2 running ─╮
+│ ● 00:23  scout-ops (scout)              working    │
+│ ◌ 00:45  explore-api (explore)          starting…  │
+╰────────────────────────────────────────────────────╯
+```
+
+`HERDR_SUBAGENT_TIMEOUT_MS` caps a single subagent (default 15 minutes) so a
+wedged child cannot hang the turn.
+
 ## Limits
 
 - **One level.** A subagent has no spawning tools, so it cannot spawn further
   subagents.
-- **No resume.** When a subagent finishes, it is done. Spawn a new one rather
-  than reviving it.
-- **Panes are left open** when a subagent completes, so you can read its work.
-  Close them yourself.
+- **No resume.** When a subagent finishes its pane closes. Spawn a new one
+  rather than reviving it. The transcript stays in
+  `~/.pi/agent/subagent-sessions/<name>/`.
 - **pi only.** No path for running other agent CLIs as subagents, though herdr
   itself supports many.
 

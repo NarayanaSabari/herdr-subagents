@@ -1,15 +1,21 @@
 /**
- * herdr-subagents: async subagents for pi, running in herdr panes.
+ * herdr-subagents: subagents for pi, running in herdr panes.
  *
- * `subagent()` returns immediately. The child runs in its own herdr pane, and
- * when it settles its result is injected back into this session as a new
- * message, so the parent can keep working while it runs.
+ * `subagent()` blocks until the child finishes and returns its report as the
+ * tool result. Several calls in one assistant turn run concurrently, so the
+ * model can fan out and still cannot conclude before every result is in.
+ *
+ * An earlier version returned immediately and delivered results later through
+ * `pi.sendMessage`. In real use the main agent simply answered first, while
+ * three subagents were still working, so its answer was written without the
+ * evidence it had asked for. Blocking removes that failure mode by
+ * construction rather than by asking the model to remember to wait.
  *
  * Why herdr rather than a terminal multiplexer: herdr already classifies every
  * pane occupant as idle / working / blocked / done and pushes those
- * transitions over its socket. Completion detection is therefore an event
- * subscription, not screen-scraping, and `blocked` gives us a real signal for
- * "this agent is stuck on an approval prompt".
+ * transitions over its socket, so completion is an event subscription rather
+ * than screen-scraping, and `blocked` is a real signal that a child is stuck
+ * on an approval prompt.
  */
 
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
@@ -24,30 +30,27 @@ import {
   closePane,
   getAgent,
   insideHerdr,
-  listAgents,
   promptAgent,
-  splitPane,
   startAgent,
   HerdrError,
 } from "./herdr.ts";
+import { createSubagentPane, releaseSubagentPane } from "./layout.ts";
 import { SubagentRegistry, type Subagent } from "./registry.ts";
 import { findSessionFile, lastAssistantMessage, truncateResult } from "./session.ts";
+import { WidgetController } from "./widget.ts";
 
 /**
- * Extensions the child must keep even though it is launched with
- * `--no-extensions`.
+ * Extensions the child keeps despite `--no-extensions`.
  *
- * This is not optional polish. Measured on 2026-08-28: a child started with a
- * bare `--no-extensions` loses the Anthropic subscription fix and dies on the
- * first turn with `400 "You're out of extra usage"`. Guards are re-added for
- * the same reason they exist in the parent - a subagent with `bash` must not
- * be able to run `git reset --hard` unchallenged.
+ * Not optional polish. Measured on 2026-08-28: a child started with a bare
+ * `--no-extensions` loses the Anthropic subscription fix and dies on its first
+ * turn with `400 "You're out of extra usage"`. Guards are re-added for the
+ * same reason they exist in the parent - a subagent with `bash` must not run
+ * `git reset --hard` unchallenged.
  *
- * These point at pi's own live extension directory rather than any particular
- * dotfiles layout, so the list keeps working however those files are managed.
- * A path that does not exist is skipped, so an unused entry is harmless.
- *
- * Override with `HERDR_SUBAGENT_EXTENSIONS`, a colon-separated list of paths.
+ * Resolved from pi's own extension directory rather than any dotfiles layout.
+ * Missing paths are dropped. Override with `HERDR_SUBAGENT_EXTENSIONS`, a
+ * colon-separated list.
  */
 const PI_EXTENSIONS_DIR = join(homedir(), ".pi", "agent", "extensions");
 
@@ -60,8 +63,11 @@ const REQUIRED_EXTENSIONS = (
       ]
 ).filter((p) => existsSync(p));
 
-/** Where child session transcripts are written, so results can be read back. */
+/** Where child transcripts are written, so results can be read back. */
 const SESSION_ROOT = join(homedir(), ".pi", "agent", "subagent-sessions");
+
+/** Hard ceiling on a single subagent, so a wedged child cannot hang the turn. */
+const SUBAGENT_TIMEOUT_MS = Number(process.env.HERDR_SUBAGENT_TIMEOUT_MS ?? 15 * 60 * 1000);
 
 const SUMMARY_INSTRUCTION = `
 
@@ -81,59 +87,63 @@ function slug(s: string): string {
   );
 }
 
+function msg(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
+function errorResult(text: string) {
+  return { content: [{ type: "text" as const, text }], isError: true };
+}
+
 export default function (pi: ExtensionAPI) {
   const registry = new SubagentRegistry();
+  const widget = new WidgetController();
 
   /**
-   * Deliver a finished subagent's result into the parent conversation.
+   * Whether a subagent left a readable result behind.
    *
-   * pi.sendMessage injects it as real context, so the model reacts to the
-   * result on its next turn rather than the user having to relay it.
+   * The registry consults this to resolve the exit-versus-completion race:
+   * `pane.exited` and the final `idle` status are independent events with no
+   * documented ordering, and panes now close on success, so an exit alone
+   * cannot mean failure.
    */
-  registry.onChange((s: Subagent) => {
-    if (s.state !== "finished" && s.state !== "failed") return;
-    if (s.delivered) return;
-    s.delivered = true;
+  registry.hasResult = (s: Subagent) => {
+    const f = findSessionFile(s.sessionDir, s.sessionId);
+    return Boolean(f && lastAssistantMessage(f));
+  };
 
-    if (s.state === "failed") {
-      void pi.sendMessage(
-        `[subagent ${s.name} FAILED] ${s.error ?? "unknown error"}\n` +
-          `Its pane (${s.paneId}) is still open if you want to inspect it.`,
-      );
-      return;
+  registry.onChange(() => widget.update(registry.all()));
+
+  /**
+   * Tear down a finished subagent's pane.
+   *
+   * Both outcomes close, including failures, so the column shrinks and the
+   * main pane reclaims its space. The result and any error text are read
+   * before this runs, so closing never discards the evidence.
+   */
+  async function reclaim(s: Subagent): Promise<void> {
+    try {
+      await closePane(s.paneId);
+    } catch {
+      // Already gone, or the user closed it. Either way, nothing to do.
     }
-
-    const file = findSessionFile(s.sessionDir, s.sessionId);
-    const text = file ? lastAssistantMessage(file) : undefined;
-    s.result = text;
-
-    if (!text) {
-      void pi.sendMessage(
-        `[subagent ${s.name} finished but produced no readable result]\n` +
-          `Session: ${file ?? s.sessionDir}\nPane: ${s.paneId}`,
-      );
-      return;
-    }
-
-    const secs = Math.round(((s.finishedAt ?? Date.now()) - s.startedAt) / 1000);
-    void pi.sendMessage(
-      `[subagent ${s.name} (${s.agent}) finished in ${secs}s]\n\n` +
-        `Task: ${s.task}\n\n${truncateResult(text)}`,
-    );
-  });
+    releaseSubagentPane(s.parentPaneId, s.paneId);
+  }
 
   pi.registerTool({
     name: "subagent",
-    label: "Spawn subagent",
+    label: "Run subagent",
     description:
-      "Spawn an autonomous subagent in its own herdr pane. Returns immediately - " +
-      "the subagent runs in parallel and its result is delivered back into this " +
-      "conversation when it finishes. Use subagents_list to see available agents.",
-    promptSnippet: "Spawn an async subagent in a herdr pane (non-blocking)",
+      "Run a task in an autonomous subagent with its own context and tool sandbox, " +
+      "in a dedicated herdr pane. Blocks until the subagent finishes and returns its " +
+      "report. Issue several subagent calls in the same turn to run them in parallel. " +
+      "Use subagents_list to see available agents.",
+    promptSnippet: "Run a task in a sandboxed subagent and get its report back",
     promptGuidelines: [
-      "Use subagent for self-contained, parallelizable work whose intermediate output you would never re-read - recon, and independent verification.",
-      "A subagent cannot see this conversation: the task string is everything it gets, so make it self-contained.",
-      "subagent returns before the work is done. Keep working; the result arrives as a later message.",
+      "Use subagent for self-contained investigation whose intermediate output you would never re-read - recon across unfamiliar code, or several independent questions at once.",
+      "A subagent cannot see this conversation. The task string is everything it gets, so make it self-contained and say what a good answer looks like.",
+      "To parallelise, issue several subagent calls in a single turn rather than one after another; they run concurrently and all must return before the turn ends.",
+      "Treat a subagent's report as evidence, not fact. Verify any claim you are about to act on.",
     ],
     parameters: Type.Object({
       agent: Type.String({
@@ -153,37 +163,29 @@ export default function (pi: ExtensionAPI) {
       ),
     }),
 
-    async execute(_id, params, _signal, _onUpdate, ctx: ExtensionContext) {
+    async execute(_id, params, signal, onUpdate, ctx: ExtensionContext) {
       if (!insideHerdr()) {
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text:
-                "Not running inside herdr (HERDR_ENV is unset), so there is no pane to " +
-                "split. Start pi inside a herdr session and try again.",
-            },
-          ],
-          isError: true,
-        };
+        return errorResult(
+          "Not running inside herdr (HERDR_ENV is unset), so there is no pane to split. " +
+            "Start pi inside a herdr session and try again.",
+        );
+      }
+      const parentPaneId = process.env.HERDR_PANE_ID;
+      if (!parentPaneId) {
+        return errorResult("HERDR_PANE_ID is unset, so the caller's pane cannot be located.");
       }
 
       const { agents, errors } = loadAgents(ctx.cwd);
       const def: AgentDef | undefined = agents.get(params.agent);
       if (!def) {
         const known = [...agents.keys()].sort().join(", ") || "(none)";
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text:
-                `Unknown agent "${params.agent}". Available: ${known}` +
-                (errors.length ? `\n\nDefinitions that failed to load:\n${errors.join("\n")}` : ""),
-            },
-          ],
-          isError: true,
-        };
+        return errorResult(
+          `Unknown agent "${params.agent}". Available: ${known}` +
+            (errors.length ? `\n\nDefinitions that failed to load:\n${errors.join("\n")}` : ""),
+        );
       }
+
+      widget.attach(ctx as unknown as Parameters<typeof widget.attach>[0]);
 
       const name = registry.uniqueName(params.name ? slug(params.name) : def.name);
       const cwd = params.cwd ?? ctx.cwd;
@@ -191,15 +193,12 @@ export default function (pi: ExtensionAPI) {
       const sessionId = `${name}-${Date.now()}`;
       mkdirSync(sessionDir, { recursive: true });
 
-      // The system prompt goes in a FILE, not on the command line.
-      //
-      // Herdr rejects any agent argument it cannot encode safely for the
-      // target shell, and a multi-line value trips that: `agent start` fails
-      // with `invalid_agent_argument`. Since every useful agent body spans
-      // several lines, passing it inline is not viable. pi's
-      // `--append-system-prompt` accepts "text or file contents", so a path
-      // sidesteps the encoding limit entirely and keeps the argument a single
-      // shell-safe token.
+      // The system prompt goes in a FILE, not on the command line. Herdr
+      // rejects any agent argument it cannot encode safely for the target
+      // shell, and a multi-line value trips that with
+      // `invalid_agent_argument`. Every useful agent body is multi-line, and
+      // pi's --append-system-prompt accepts "text or file contents", so a path
+      // sidesteps the limit and keeps the argument one shell-safe token.
       const promptFile = join(sessionDir, `${sessionId}.system.md`);
       writeFileSync(promptFile, def.body + SUMMARY_INSTRUCTION, "utf8");
 
@@ -218,61 +217,111 @@ export default function (pi: ExtensionAPI) {
 
       let paneId: string;
       try {
-        paneId = await splitPane({
-          fromPaneId: process.env.HERDR_PANE_ID,
-          direction: "right",
+        paneId = await createSubagentPane({
+          parentPaneId,
           cwd,
-          env: { HERDR_SUBAGENT: name, HERDR_SUBAGENT_PARENT: process.env.HERDR_PANE_ID ?? "" },
+          env: { HERDR_SUBAGENT: name, HERDR_SUBAGENT_PARENT: parentPaneId },
         });
       } catch (err) {
-        return errorResult(`Could not split a pane: ${msg(err)}`);
+        return errorResult(`Could not create a pane for the subagent: ${msg(err)}`);
       }
 
       try {
         await startAgent({ name, paneId, piArgs, timeoutMs: 60_000 });
       } catch (err) {
-        // Leave no orphan pane behind if the agent never came up.
         try {
           await closePane(paneId);
         } catch {
           /* best effort */
         }
+        releaseSubagentPane(parentPaneId, paneId);
         return errorResult(`Could not start pi in pane ${paneId}: ${msg(err)}`);
       }
+
+      let settle!: (s: Subagent) => void;
+      const done = new Promise<Subagent>((resolve) => {
+        settle = resolve;
+      });
 
       const sub: Subagent = {
         name,
         agent: def.name,
         task: params.task,
         paneId,
+        parentPaneId,
         sessionDir,
         sessionId,
         state: "starting",
         startedAt: Date.now(),
-        delivered: false,
+        done,
+        settle,
       };
       registry.add(sub);
+      widget.update(registry.all());
+
+      onUpdate?.({
+        content: [{ type: "text", text: `Running ${name} (${def.name}) in pane ${paneId}…\n` }],
+      });
 
       try {
-        // Fire and forget: the registry's event watcher handles completion.
         await promptAgent({ target: name, text: params.task, wait: false });
       } catch (err) {
         registry.transition(name, "failed", { error: `prompt failed: ${msg(err)}` });
+        await reclaim(sub);
         return errorResult(`Started ${name} but could not prompt it: ${msg(err)}`);
+      }
+
+      // Block until the child settles, the caller aborts, or the ceiling hits.
+      const timeout = new Promise<"timeout">((r) =>
+        setTimeout(() => r("timeout"), SUBAGENT_TIMEOUT_MS).unref?.(),
+      );
+      const aborted = new Promise<"aborted">((r) => {
+        if (signal) signal.addEventListener("abort", () => r("aborted"), { once: true });
+      });
+
+      const outcome = await Promise.race([done, timeout, aborted]);
+      widget.update(registry.all());
+
+      if (outcome === "timeout" || outcome === "aborted") {
+        const why =
+          outcome === "timeout"
+            ? `did not finish within ${Math.round(SUBAGENT_TIMEOUT_MS / 60000)} minutes`
+            : "was cancelled";
+        registry.transition(name, "failed", { error: why });
+        const partial = registry.hasResult?.(sub)
+          ? lastAssistantMessage(findSessionFile(sessionDir, sessionId)!)
+          : undefined;
+        await reclaim(sub);
+        return errorResult(
+          `Subagent ${name} ${why}.` +
+            (partial ? `\n\nPartial output before it stopped:\n${truncateResult(partial)}` : ""),
+        );
+      }
+
+      const file = findSessionFile(sessionDir, sessionId);
+      const text = file ? lastAssistantMessage(file) : undefined;
+      const secs = Math.round(((sub.finishedAt ?? Date.now()) - sub.startedAt) / 1000);
+
+      await reclaim(sub);
+      widget.update(registry.all());
+
+      if (sub.state === "failed" && !text) {
+        return errorResult(`Subagent ${name} failed: ${sub.error ?? "unknown error"}`);
+      }
+      if (!text) {
+        return errorResult(
+          `Subagent ${name} finished but produced no readable result. Transcript: ${file ?? sessionDir}`,
+        );
       }
 
       return {
         content: [
           {
             type: "text" as const,
-            text:
-              `Spawned subagent "${name}" (${def.name}) in pane ${paneId}.\n` +
-              `Tools: ${def.tools.join(", ")}\n` +
-              `It is running now; its result will arrive here when it finishes. ` +
-              `Continue with other work rather than waiting.`,
+            text: `[${name} (${def.name}) finished in ${secs}s]\n\n${truncateResult(text)}`,
           },
         ],
-        details: { name, agent: def.name, paneId, tools: def.tools },
+        details: { name, agent: def.name, seconds: secs, transcript: file },
       };
     },
   });
@@ -280,28 +329,31 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "subagents_list",
     label: "List subagents",
-    description:
-      "List available subagent definitions and the status of any currently running subagents.",
-    promptSnippet: "List available subagent types and running subagents",
+    description: "List the available subagent definitions and their tool sandboxes.",
+    promptSnippet: "List available subagent types",
     parameters: Type.Object({}),
     async execute(_id, _params, _signal, _onUpdate, ctx: ExtensionContext) {
       const { agents, errors } = loadAgents(ctx.cwd);
       const lines: string[] = ["Available agents:"];
-      if (agents.size === 0) lines.push("  (none found)");
+      if (agents.size === 0) {
+        lines.push(
+          "  (none found)",
+          "",
+          "Agent definitions are .md files in .pi/agents/ or ~/.pi/agent/agents/.",
+        );
+      }
       for (const a of [...agents.values()].sort((x, y) => x.name.localeCompare(y.name))) {
         lines.push(`  ${a.name} - ${a.description}`);
         lines.push(`      tools: ${a.tools.join(", ")}${a.model ? ` | model: ${a.model}` : ""}`);
       }
 
-      const live = registry.all();
+      const live = registry.all().filter((s) => s.state !== "finished" && s.state !== "failed");
       if (live.length) {
-        lines.push("", "Subagents this session:");
+        lines.push("", "Currently running:");
         for (const s of live) {
-          const secs = Math.round(((s.finishedAt ?? Date.now()) - s.startedAt) / 1000);
-          lines.push(`  ${s.name} (${s.agent}) - ${s.state} - ${secs}s - pane ${s.paneId}`);
+          lines.push(`  ${s.name} (${s.agent}) - ${s.state} - pane ${s.paneId}`);
         }
       }
-
       if (errors.length) {
         lines.push("", "Definitions that failed to load:", ...errors.map((e) => `  ${e}`));
       }
@@ -311,54 +363,12 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.registerTool({
-    name: "subagent_status",
-    label: "Subagent status",
-    description:
-      "Check a running subagent's live state, or read what it has produced so far without waiting for it to finish.",
-    promptSnippet: "Check a running subagent's state",
-    parameters: Type.Object({
-      name: Type.String({ description: "Subagent name, as returned by subagent." }),
-    }),
-    async execute(_id, params) {
-      const s = registry.get(params.name);
-      if (!s) {
-        const known = registry.all().map((a) => a.name).join(", ") || "(none)";
-        return errorResult(`No subagent named "${params.name}". Known: ${known}`);
-      }
-
-      let liveStatus = "unknown";
-      try {
-        liveStatus = (await getAgent(s.name)).agent_status ?? "unknown";
-      } catch {
-        /* the pane may already be gone */
-      }
-
-      const file = findSessionFile(s.sessionDir, s.sessionId);
-      const partial = file ? lastAssistantMessage(file) : undefined;
-      const secs = Math.round(((s.finishedAt ?? Date.now()) - s.startedAt) / 1000);
-
-      return {
-        content: [
-          {
-            type: "text" as const,
-            text:
-              `${s.name} (${s.agent})\n` +
-              `  tracked state: ${s.state}\n  herdr status:  ${liveStatus}\n` +
-              `  pane: ${s.paneId}\n  elapsed: ${secs}s\n` +
-              (partial ? `\nLatest output:\n${truncateResult(partial, 4000)}` : "\n(no output yet)"),
-          },
-        ],
-      };
-    },
-  });
-
-  pi.registerTool({
     name: "subagent_message",
     label: "Message subagent",
     description:
-      "Send a follow-up message to a running subagent, for example to redirect or add context. " +
-      "Returns immediately; the subagent picks it up at its next turn boundary.",
-    promptSnippet: "Send a follow-up message to a running subagent",
+      "Send a follow-up message to a subagent that is still running. Only useful from a " +
+      "different turn, since subagent blocks until its child finishes.",
+    promptSnippet: "Send a follow-up to a running subagent",
     parameters: Type.Object({
       name: Type.String({ description: "Subagent name." }),
       message: Type.String({ description: "Message to send." }),
@@ -371,7 +381,7 @@ export default function (pi: ExtensionAPI) {
       }
       if (s.state === "finished" || s.state === "failed") {
         return errorResult(
-          `Subagent "${params.name}" has already ${s.state}. Spawn a new one rather than reviving it.`,
+          `Subagent "${params.name}" has already ${s.state}; its pane is closed. Spawn a new one.`,
         );
       }
       try {
@@ -386,31 +396,55 @@ export default function (pi: ExtensionAPI) {
         }
         return errorResult(`Could not message "${params.name}": ${msg(err)}`);
       }
+      return { content: [{ type: "text" as const, text: `Message delivered to ${params.name}.` }] };
+    },
+  });
+
+  pi.registerTool({
+    name: "subagent_status",
+    label: "Subagent status",
+    description: "Check a running subagent's live state and its output so far.",
+    promptSnippet: "Check a running subagent's state",
+    parameters: Type.Object({
+      name: Type.String({ description: "Subagent name." }),
+    }),
+    async execute(_id, params) {
+      const s = registry.get(params.name);
+      if (!s) {
+        const known = registry.all().map((a) => a.name).join(", ") || "(none)";
+        return errorResult(`No subagent named "${params.name}". Known: ${known}`);
+      }
+
+      let live = "unknown";
+      try {
+        live = (await getAgent(s.name)).agent_status ?? "unknown";
+      } catch {
+        /* pane may be gone */
+      }
+      const file = findSessionFile(s.sessionDir, s.sessionId);
+      const partial = file ? lastAssistantMessage(file) : undefined;
+      const secs = Math.round(((s.finishedAt ?? Date.now()) - s.startedAt) / 1000);
+
       return {
-        content: [{ type: "text" as const, text: `Message delivered to ${params.name}.` }],
+        content: [
+          {
+            type: "text" as const,
+            text:
+              `${s.name} (${s.agent})\n  tracked: ${s.state}\n  herdr:   ${live}\n` +
+              `  pane: ${s.paneId}\n  elapsed: ${secs}s\n` +
+              (partial ? `\nLatest output:\n${truncateResult(partial, 4000)}` : "\n(no output yet)"),
+          },
+        ],
       };
     },
   });
 
-  // Surface orphans from a previous run rather than pretending they are ours.
-  pi.on("session_start", async () => {
-    if (!insideHerdr()) return;
-    try {
-      await listAgents();
-    } catch {
-      /* herdr may not be reachable; the tools report that when used */
-    }
+  pi.on("session_start", async (_e, ctx) => {
+    widget.attach(ctx as unknown as Parameters<typeof widget.attach>[0]);
   });
 
   pi.on("session_shutdown", async () => {
+    widget.dispose();
     registry.dispose();
   });
-}
-
-function msg(err: unknown): string {
-  return err instanceof Error ? err.message : String(err);
-}
-
-function errorResult(text: string) {
-  return { content: [{ type: "text" as const, text }], isError: true };
 }

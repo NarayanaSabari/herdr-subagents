@@ -38,12 +38,16 @@ export interface AgentInfo {
 }
 
 export class HerdrError extends Error {
-  constructor(
-    message: string,
-    readonly code?: string,
-  ) {
+  // Written as an explicit field rather than a constructor parameter property:
+  // Node's built-in type stripper rejects `readonly code` in a parameter list
+  // with ERR_UNSUPPORTED_TYPESCRIPT_SYNTAX, and this package is loaded
+  // directly from source by pi and by `node --test`, with no build step.
+  readonly code?: string;
+
+  constructor(message: string, code?: string) {
     super(message);
     this.name = "HerdrError";
+    this.code = code;
   }
 }
 
@@ -113,18 +117,30 @@ export async function splitPane(opts: {
   fromPaneId?: string;
   direction: "right" | "down" | "left" | "up";
   cwd: string;
+  ratio?: number;
   env?: Record<string, string>;
 }): Promise<string> {
   const args = ["pane", "split"];
   if (opts.fromPaneId) args.push(opts.fromPaneId);
   else args.push("--current");
   args.push("--direction", opts.direction, "--cwd", opts.cwd, "--no-focus");
+  if (opts.ratio !== undefined) args.push("--ratio", String(opts.ratio));
   for (const [k, v] of Object.entries(opts.env ?? {})) args.push("--env", `${k}=${v}`);
 
   const res = await herdr<{ pane: PaneInfo }>(args);
   const id = res?.pane?.pane_id;
   if (!id) throw new HerdrError("pane split returned no pane_id");
   return id;
+}
+
+/** Whether a pane is still open. Used before splitting from a tracked pane. */
+export async function paneExists(paneId: string): Promise<boolean> {
+  try {
+    await herdr(["pane", "get", paneId], 10_000);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /** Report the pane's layout, used to decide split direction. */

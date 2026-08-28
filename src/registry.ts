@@ -29,6 +29,8 @@ export interface Subagent {
   /** Task text as given by the caller. */
   task: string;
   paneId: string;
+  /** Pane this subagent was spawned from, for column bookkeeping. */
+  parentPaneId: string;
   sessionDir: string;
   sessionId: string;
   state: SubagentState;
@@ -38,8 +40,10 @@ export interface Subagent {
   result?: string;
   /** Failure detail, when state is "failed". */
   error?: string;
-  /** True once the parent has been told about the result. */
-  delivered: boolean;
+  /** Resolves when this subagent reaches a terminal state. */
+  done: Promise<Subagent>;
+  /** Internal: settles `done`. */
+  settle?: (s: Subagent) => void;
 }
 
 type Listener = (s: Subagent) => void;
@@ -48,6 +52,14 @@ export class SubagentRegistry {
   private readonly agents = new Map<string, Subagent>();
   private readonly listeners = new Set<Listener>();
   private readonly watchers = new Map<string, { stop: () => void }>();
+
+  /**
+   * Decides whether a subagent left a usable result behind.
+   *
+   * Injected so the registry stays free of session-file parsing, and so tests
+   * can drive the exit-versus-completion race directly.
+   */
+  hasResult?: (s: Subagent) => boolean;
 
   /** Register a freshly spawned subagent and begin watching its pane. */
   add(s: Subagent): void {
@@ -67,9 +79,9 @@ export class SubagentRegistry {
     return this.all().filter((s) => s.state === "starting" || s.state === "working" || s.state === "blocked");
   }
 
-  /** Finished subagents whose results have not yet reached the parent. */
-  undelivered(): Subagent[] {
-    return this.all().filter((s) => !s.delivered && (s.state === "finished" || s.state === "failed"));
+  /** Finished subagents, terminal either way. */
+  finished(): Subagent[] {
+    return this.all().filter((s) => s.state === "finished" || s.state === "failed");
   }
 
   onChange(fn: Listener): () => void {
@@ -107,6 +119,7 @@ export class SubagentRegistry {
       s.finishedAt = Date.now();
       this.watchers.get(name)?.stop();
       this.watchers.delete(name);
+      s.settle?.(s);
     }
     this.emit(s);
   }
@@ -135,7 +148,20 @@ export class SubagentRegistry {
     this.watchers.set(s.name, w);
   }
 
-  /** Feed a decoded herdr event into the state machine. */
+  /**
+   * Feed a decoded herdr event into the state machine.
+   *
+   * Ordering note: `pane.exited` and the final `agent_status_changed(idle)`
+   * are separate events and herdr publishes no guarantee about their relative
+   * order. Treating an exit as failure unconditionally would therefore lose
+   * the result of a subagent that finished correctly and then closed - which
+   * is exactly what happens once panes auto-close on completion.
+   *
+   * So an exit is only a failure when the child left no readable result
+   * behind. The session file is the arbiter: it is written before the process
+   * exits, so if a final assistant message exists the work did complete,
+   * whichever event we happen to see first.
+   */
   handleEvent(event: string, data: Record<string, unknown>): void {
     const paneId = data.pane_id as string | undefined;
     if (!paneId) return;
@@ -143,9 +169,12 @@ export class SubagentRegistry {
     if (!s) return;
 
     if (event === "pane.exited" || event === "pane.closed") {
-      if (s.state !== "finished" && s.state !== "failed") {
-        this.transition(s.name, "failed", { error: "pane exited before the agent reported a result" });
-      }
+      if (s.state === "finished" || s.state === "failed") return;
+      if (this.hasResult?.(s)) this.transition(s.name, "finished");
+      else
+        this.transition(s.name, "failed", {
+          error: "pane exited before the agent produced a result",
+        });
       return;
     }
 

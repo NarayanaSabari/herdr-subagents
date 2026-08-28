@@ -121,7 +121,37 @@ interface WidgetHost {
       content: string[] | undefined,
       options?: { placement?: "aboveEditor" | "belowEditor" },
     ): void;
+    /** Replaces the streaming loader text. No argument restores the default. */
+    setWorkingMessage?(message?: string): void;
   };
+}
+
+/**
+ * Loader text for the streaming indicator while subagents run.
+ *
+ * The default reads "Working…", which during a blocking subagent call is
+ * indistinguishable from the main agent thinking. Naming what is being waited
+ * on is the difference between a visible wait and an apparent hang.
+ */
+export function workingMessage(agents: Subagent[]): string | undefined {
+  const live = agents.filter((a) => a.state !== "finished" && a.state !== "failed");
+  if (live.length === 0) return undefined;
+
+  const blocked = live.filter((a) => a.state === "blocked");
+  if (blocked.length) {
+    // Needs a human. Say so instead of implying progress.
+    const names = blocked.map((a) => a.name).join(", ");
+    return `Subagent ${names} is blocked and needs input`;
+  }
+
+  if (live.length === 1) {
+    const a = live[0];
+    return `Waiting on subagent ${a.name} (${a.agent})`;
+  }
+
+  const names = live.map((a) => a.name).join(", ");
+  const label = `Waiting on ${live.length} subagents: ${names}`;
+  return label.length <= 90 ? label : `Waiting on ${live.length} subagents`;
 }
 
 /**
@@ -152,9 +182,12 @@ export class WidgetController {
     const host = this.host;
     if (!host?.hasUI) return;
 
-    const lines = renderWidget(this.supplier());
+    const agents = this.supplier();
+    const lines = renderWidget(agents);
     try {
       host.ui.setWidget(WIDGET_KEY, lines, { placement: "aboveEditor" });
+      // Name what is being waited on; undefined restores pi's default text.
+      host.ui.setWorkingMessage?.(workingMessage(agents));
     } catch {
       // A widget failure must never break a spawn.
     }
@@ -176,6 +209,9 @@ export class WidgetController {
     this.stop();
     try {
       this.host?.ui.setWidget(WIDGET_KEY, undefined);
+      // Hand the loader text back, or a stale "Waiting on subagent …" would
+      // outlive the subagents and sit there through unrelated turns.
+      this.host?.ui.setWorkingMessage?.();
     } catch {
       /* shutting down anyway */
     }

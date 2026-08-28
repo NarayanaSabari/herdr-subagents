@@ -170,7 +170,13 @@ Blocking removes that by construction instead of asking the model to remember
 to wait. Parallelism is unaffected - several `subagent` calls in one assistant
 turn execute concurrently, and the turn cannot end until all of them return.
 
-While they run, a widget above the editor shows what is happening:
+While they run, the streaming loader names what is being waited on, and a
+widget above the editor shows each one:
+
+```
+⠧ Waiting on 2 subagents: slowone, slowtwo
+```
+
 
 ```
 ╭─ Subagents ──────────────────────────── 2 running ─╮

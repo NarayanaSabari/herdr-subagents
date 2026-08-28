@@ -317,3 +317,69 @@ test("wrapping preserves the words it breaks", async () => {
   const joined = wrap(src, 30).join(" ").replace(/\s+/g, " ").trim();
   assert.equal(joined, src.replace(/\s+/g, " ").trim());
 });
+
+// ── working message ────────────────────────────────────────────────────────
+
+test("loader text names what is being waited on", async () => {
+  const { workingMessage } = await import("../src/widget.ts");
+
+  assert.equal(workingMessage([]), undefined, "nothing running: pi's default stands");
+  assert.equal(
+    workingMessage([fakeSub({ state: "finished" })]),
+    undefined,
+    "finished agents do not keep the message alive",
+  );
+
+  assert.match(
+    workingMessage([fakeSub({ name: "scout-ops", agent: "scout", state: "working" })]) ?? "",
+    /Waiting on subagent scout-ops \(scout\)/,
+  );
+
+  const three = workingMessage([
+    fakeSub({ name: "a", state: "working" }),
+    fakeSub({ name: "b", paneId: "w1:p3", state: "working" }),
+    fakeSub({ name: "c", paneId: "w1:p4", state: "starting" }),
+  ]);
+  assert.match(three ?? "", /Waiting on 3 subagents: a, b, c/);
+});
+
+test("a blocked subagent is called out, not shown as progress", async () => {
+  const { workingMessage } = await import("../src/widget.ts");
+  const m = workingMessage([
+    fakeSub({ name: "a", state: "working" }),
+    fakeSub({ name: "needs-input", paneId: "w1:p3", state: "blocked" }),
+  ]);
+  assert.match(m ?? "", /needs-input is blocked and needs input/);
+});
+
+test("loader text stays short with many subagents", async () => {
+  const { workingMessage } = await import("../src/widget.ts");
+  const many = Array.from({ length: 12 }, (_, i) =>
+    fakeSub({ name: `subagent-number-${i}`, paneId: `w1:p${i + 2}`, state: "working" }),
+  );
+  const m = workingMessage(many) ?? "";
+  assert.ok(m.length <= 90, `too long for a loader line: ${m.length}`);
+  assert.match(m, /Waiting on 12 subagents/);
+});
+
+test("dispose restores pi's default loader text", async () => {
+  const { WidgetController } = await import("../src/widget.ts");
+  const calls: (string | undefined)[] = [];
+  const wc = new WidgetController();
+  wc.attach(
+    {
+      hasUI: true,
+      ui: {
+        setWidget() {},
+        setWorkingMessage(m?: string) {
+          calls.push(m);
+        },
+      },
+    },
+    () => [fakeSub({ state: "working" })],
+  );
+  wc.update();
+  assert.ok(calls.at(-1), "sets a message while running");
+  wc.dispose();
+  assert.equal(calls.at(-1), undefined, "hands the loader back on dispose");
+});

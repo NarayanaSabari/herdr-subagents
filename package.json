@@ -1,0 +1,23 @@
+{
+  "name": "herdr-subagents",
+  "version": "0.1.0",
+  "description": "Async subagents for pi, running in herdr panes",
+  "keywords": ["pi-package", "pi-extension", "herdr", "subagents"],
+  "license": "MIT",
+  "author": "NarayanaSabari",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/NarayanaSabari/herdr-subagents"
+  },
+  "type": "module",
+  "scripts": {
+    "test": "node --test test/*.test.ts"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": ">=0.84.0",
+    "typebox": "*"
+  },
+  "pi": {
+    "extensions": ["./src/index.ts"]
+  }
+}

@@ -19,13 +19,13 @@
  */
 
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
 import { join } from "node:path";
 
 import { Type } from "typebox";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
 import { loadAgents, type AgentDef } from "./agents.ts";
+import { adoptPiPaths, piPaths } from "./pi-paths.ts";
 import {
   closePane,
   getAgent,
@@ -48,23 +48,24 @@ import { WidgetController } from "./widget.ts";
  * same reason they exist in the parent - a subagent with `bash` must not run
  * `git reset --hard` unchallenged.
  *
- * Resolved from pi's own extension directory rather than any dotfiles layout.
+ * Resolved from pi's own agent directory via `getAgentDir()`, which honours
+ * `PI_CODING_AGENT_DIR`, rather than a hardcoded `~/.pi` that would silently
+ * read the default config even when pi is running against another one.
  * Missing paths are dropped. Override with `HERDR_SUBAGENT_EXTENSIONS`, a
  * colon-separated list.
  */
-const PI_EXTENSIONS_DIR = join(homedir(), ".pi", "agent", "extensions");
+const PI_EXTENSIONS_DIR = () => join(piPaths().agentDir, "extensions");
 
-const REQUIRED_EXTENSIONS = (
-  process.env.HERDR_SUBAGENT_EXTENSIONS
+function requiredExtensions(): string[] {
+  const dir = PI_EXTENSIONS_DIR();
+  const paths = process.env.HERDR_SUBAGENT_EXTENSIONS
     ? process.env.HERDR_SUBAGENT_EXTENSIONS.split(":").filter(Boolean)
-    : [
-        join(PI_EXTENSIONS_DIR, "anthropic-subscription-fix.ts"),
-        join(PI_EXTENSIONS_DIR, "guards"),
-      ]
-).filter((p) => existsSync(p));
+    : [join(dir, "anthropic-subscription-fix.ts"), join(dir, "guards")];
+  return paths.filter((p) => existsSync(p));
+}
 
 /** Where child transcripts are written, so results can be read back. */
-const SESSION_ROOT = join(homedir(), ".pi", "agent", "subagent-sessions");
+const SESSION_ROOT = () => join(piPaths().agentDir, "subagent-sessions");
 
 /** Hard ceiling on a single subagent, so a wedged child cannot hang the turn. */
 const SUBAGENT_TIMEOUT_MS = Number(process.env.HERDR_SUBAGENT_TIMEOUT_MS ?? 15 * 60 * 1000);
@@ -95,7 +96,10 @@ function errorResult(text: string) {
   return { content: [{ type: "text" as const, text }], isError: true };
 }
 
-export default function (pi: ExtensionAPI) {
+export default async function (pi: ExtensionAPI) {
+  // Upgrade to pi's real path helpers before anything resolves a path.
+  await adoptPiPaths();
+
   const registry = new SubagentRegistry();
   const widget = new WidgetController();
 
@@ -163,6 +167,13 @@ export default function (pi: ExtensionAPI) {
       ),
     }),
 
+    // Concurrency is the point: several subagent calls in one assistant turn
+    // should run at once. pi's default is already parallel (measured: three
+    // 3-second probes returned identical start and end timestamps), but the
+    // default is a setting and this tool's usefulness depends on it, so pin it
+    // rather than inherit it.
+    executionMode: "parallel",
+
     async execute(_id, params, signal, onUpdate, ctx: ExtensionContext) {
       if (!insideHerdr()) {
         return errorResult(
@@ -189,7 +200,7 @@ export default function (pi: ExtensionAPI) {
 
       const name = registry.uniqueName(params.name ? slug(params.name) : def.name);
       const cwd = params.cwd ?? ctx.cwd;
-      const sessionDir = join(SESSION_ROOT, name);
+      const sessionDir = join(SESSION_ROOT(), name);
       const sessionId = `${name}-${Date.now()}`;
       mkdirSync(sessionDir, { recursive: true });
 
@@ -211,7 +222,7 @@ export default function (pi: ExtensionAPI) {
         "--tools", def.tools.join(","),
         "--append-system-prompt", promptFile,
       ];
-      for (const ext of REQUIRED_EXTENSIONS) piArgs.push("-e", ext);
+      for (const ext of requiredExtensions()) piArgs.push("-e", ext);
       if (def.model) piArgs.push("--model", def.model);
       if (def.thinking) piArgs.push("--thinking", def.thinking);
 

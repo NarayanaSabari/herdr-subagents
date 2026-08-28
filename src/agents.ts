@@ -26,8 +26,9 @@
  */
 
 import { readFileSync, readdirSync, existsSync } from "node:fs";
-import { homedir } from "node:os";
 import { join, basename } from "node:path";
+
+import { piPaths } from "./pi-paths.ts";
 
 export interface AgentDef {
   /** Agent name, from the filename. */
@@ -48,9 +49,18 @@ export interface AgentDef {
 
 export class AgentDefError extends Error {}
 
-/** Search roots, highest priority first. */
+/**
+ * Search roots, highest priority first.
+ *
+ * Paths come from pi's own helpers rather than a hardcoded `~/.pi`:
+ * `getAgentDir()` honours `PI_CODING_AGENT_DIR`, so an isolated or rebranded
+ * config directory resolves correctly instead of silently reading the default
+ * one, and `CONFIG_DIR_NAME` keeps the project-local directory in step with
+ * whatever the distribution calls it.
+ */
 export function agentSearchPaths(cwd: string): string[] {
-  return [join(cwd, ".pi", "agents"), join(homedir(), ".pi", "agent", "agents")];
+  const { configDirName, agentDir } = piPaths();
+  return [join(cwd, configDirName, "agents"), join(agentDir, "agents")];
 }
 
 /**

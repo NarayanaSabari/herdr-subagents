@@ -29,9 +29,37 @@
  * The column is tracked per parent pane. When every subagent finishes and its
  * pane closes, the column is forgotten and the next spawn starts a fresh one,
  * which is what makes main reclaim the full width.
+ *
+ * ## Why that is still not the default
+ *
+ * Even done correctly, splitting takes half the window away from whatever you
+ * were reading, every time you spawn. With four subagents the main pane is a
+ * quarter of the screen and the useful content is the pane you are no longer
+ * looking at. So the default is `tab`: subagents run in an unfocused tab,
+ * the main pane keeps its full size, and the panel's Enter takes you to a
+ * child when you actually want one. Set `HERDR_SUBAGENT_LAYOUT=split` for the
+ * side-by-side column above.
  */
 
-import { paneExists as realPaneExists, splitPane as realSplitPane } from "./herdr.ts";
+import {
+  closeTab as realCloseTab,
+  createTab as realCreateTab,
+  paneExists as realPaneExists,
+  splitPane as realSplitPane,
+} from "./herdr.ts";
+
+/** Where subagent panes go. */
+export type LayoutMode = "tab" | "split";
+
+/**
+ * Layout mode, read fresh each time so it can be changed without a restart.
+ *
+ * Anything other than `split` means `tab`: an unrecognised value should give
+ * the unobtrusive behaviour, not the one that rearranges your screen.
+ */
+export function layoutMode(): LayoutMode {
+  return process.env.HERDR_SUBAGENT_LAYOUT === "split" ? "split" : "tab";
+}
 
 /**
  * Pane operations, injectable so the concurrency behaviour can be tested
@@ -41,9 +69,16 @@ import { paneExists as realPaneExists, splitPane as realSplitPane } from "./herd
 export interface PaneOps {
   splitPane: typeof realSplitPane;
   paneExists: typeof realPaneExists;
+  createTab: typeof realCreateTab;
+  closeTab: typeof realCloseTab;
 }
 
-let ops: PaneOps = { splitPane: realSplitPane, paneExists: realPaneExists };
+let ops: PaneOps = {
+  splitPane: realSplitPane,
+  paneExists: realPaneExists,
+  createTab: realCreateTab,
+  closeTab: realCloseTab,
+};
 
 /** Test seam: swap the pane operations. Returns a restore function. */
 export function setPaneOps(next: Partial<PaneOps>): () => void {
@@ -56,6 +91,9 @@ export function setPaneOps(next: Partial<PaneOps>): () => void {
 
 /** Panes forming the subagent column, oldest first, for one parent pane. */
 const columns = new Map<string, string[]>();
+
+/** Background tab hosting the column, when running in `tab` mode. */
+const tabs = new Map<string, string>();
 
 /**
  * Serialises pane creation per parent pane.
@@ -100,6 +138,29 @@ export async function createSubagentPane(opts: {
   return withColumnLock(opts.parentPaneId, async () => {
     const existing = await liveColumn(opts.parentPaneId);
 
+    if (layoutMode() === "tab") {
+      // First subagent opens the tab; the rest stack inside it, so the whole
+      // group stays in one place the user can flip to and back from.
+      if (!existing.length) {
+        const { tabId, paneId } = await ops.createTab({
+          cwd: opts.cwd,
+          label: "subagents",
+          env: opts.env,
+        });
+        if (tabId) tabs.set(opts.parentPaneId, tabId);
+        columns.set(opts.parentPaneId, [paneId]);
+        return paneId;
+      }
+      const paneId = await ops.splitPane({
+        fromPaneId: existing[existing.length - 1],
+        direction: "down",
+        cwd: opts.cwd,
+        env: opts.env,
+      });
+      columns.set(opts.parentPaneId, [...existing, paneId]);
+      return paneId;
+    }
+
     const paneId = existing.length
       ? await ops.splitPane({
           fromPaneId: existing[existing.length - 1],
@@ -125,8 +186,21 @@ export function releaseSubagentPane(parentPaneId: string, paneId: string): void 
   const col = columns.get(parentPaneId);
   if (!col) return;
   const next = col.filter((p) => p !== paneId);
-  if (next.length) columns.set(parentPaneId, next);
-  else columns.delete(parentPaneId);
+  if (next.length) {
+    columns.set(parentPaneId, next);
+    return;
+  }
+  columns.delete(parentPaneId);
+
+  // Last subagent gone: close the tab too, or an empty "subagents" tab would
+  // accumulate in the tab bar after every run.
+  const tabId = tabs.get(parentPaneId);
+  if (tabId) {
+    tabs.delete(parentPaneId);
+    void ops.closeTab(tabId).catch(() => {
+      // Already closed, or the user closed it. Nothing to do.
+    });
+  }
 }
 
 /**
@@ -153,6 +227,7 @@ async function liveColumn(parentPaneId: string): Promise<string[]> {
 /** Test seam: drop all tracked columns. */
 export function resetColumns(): void {
   columns.clear();
+  tabs.clear();
 }
 
 /** Test seam: inspect the tracked column for a parent pane. */

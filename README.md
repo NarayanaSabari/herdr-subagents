@@ -7,17 +7,19 @@ Async subagents for [pi](https://github.com/badlogic/pi-mono), running in
 returns its report. Issue several calls in one turn and they run concurrently.
 
 ```
-+------------------+------------------+
-|                  |   scout (a)      |
-|      MAIN        +------------------+
-|      50%         |   scout (b)      |
-|                  +------------------+
-|                  |   scout (c)      |
-+------------------+------------------+
++--------------------+  +-- subagents (background tab) --+
+|                    |  |  scout (a)                     |
+|   MAIN, untouched  |  +--------------------------------+
+|   full width       |  |  scout (b)                     |
+|                    |  +--------------------------------+
+|                    |  |  scout (c)                     |
++--------------------+  +--------------------------------+
 ```
 
-Main keeps its half however many subagents run; they stack in the right column
-and their panes close as they finish, so main reclaims the full width.
+Spawning does not rearrange your screen: the children go in a tab that is
+created unfocused and closes itself when the last one finishes. A live panel
+above the editor lists them, and ↓ then Enter takes you to any of them.
+`HERDR_SUBAGENT_LAYOUT=split` puts them beside you instead.
 
 ## Why herdr
 
@@ -220,6 +222,33 @@ gives way rather than competing:
 Stopping a subagent this way is reported to the main agent as a deliberate
 stop, not a failure, so it will not quietly restart the work you just called
 off.
+
+### Where subagents run
+
+By default they run in a **background tab**, so spawning never rearranges what
+you are looking at. Your pane keeps its full width however many subagents are
+running, and Enter on a panel row switches to the child and back.
+
+```
+┌ 1: main ──┬ subagents ─┐        the tab is created unfocused
+│ your pane, full width  │        and closes itself when the last
+│                        │        subagent finishes
+└────────────────────────┘
+```
+
+Set `HERDR_SUBAGENT_LAYOUT=split` to get the old side-by-side column instead:
+
+```
++--------------+--------------+
+|              |  subagent 1  |
+|     MAIN     +--------------+
+|     50%      |  subagent 2  |
++--------------+--------------+
+```
+
+Split mode keeps main at half the window however many subagents run, but it
+still takes that half from whatever you were reading, which is why it is no
+longer the default.
 
 `HERDR_SUBAGENT_TIMEOUT_MS` caps a single subagent (default 15 minutes) so a
 wedged child cannot hang the turn.

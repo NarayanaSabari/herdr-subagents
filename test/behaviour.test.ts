@@ -169,6 +169,10 @@ test("concurrent spawns split main ONCE, then stack downward", async () => {
   // Reproduces a bug measured in a live session: three parallel subagent
   // calls each read an empty column and each split main, leaving main at
   // 12 of 94 columns with all four panes side by side.
+  //
+  // Split mode is opt-in now, so the test has to ask for it: the default
+  // puts subagents in a background tab and never touches the main pane.
+  process.env.HERDR_SUBAGENT_LAYOUT = "split";
   const { createSubagentPane, resetColumns, trackedColumn, setPaneOps } =
     await import("../src/layout.ts");
 
@@ -202,10 +206,12 @@ test("concurrent spawns split main ONCE, then stack downward", async () => {
   } finally {
     restore();
     resetColumns();
+    delete process.env.HERDR_SUBAGENT_LAYOUT;
   }
 });
 
 test("an emptied column starts fresh, splitting main again", async () => {
+  process.env.HERDR_SUBAGENT_LAYOUT = "split";
   const { createSubagentPane, releaseSubagentPane, resetColumns, setPaneOps } =
     await import("../src/layout.ts");
 
@@ -234,6 +240,7 @@ test("an emptied column starts fresh, splitting main again", async () => {
   } finally {
     restore();
     resetColumns();
+    delete process.env.HERDR_SUBAGENT_LAYOUT;
   }
 });
 
@@ -382,4 +389,98 @@ test("dispose restores pi's default loader text", async () => {
   assert.ok(calls.at(-1), "sets a message while running");
   wc.dispose();
   assert.equal(calls.at(-1), undefined, "hands the loader back on dispose");
+});
+
+// ── background tab layout (the default) ────────────────────────────────────
+
+test("subagents never touch the main pane by default", async () => {
+  // The complaint that motivated this: four subagents split the window four
+  // ways, so the pane you were reading became a quarter of the screen. The
+  // default now opens an unfocused tab and leaves the main pane alone.
+  const { createSubagentPane, resetColumns, setPaneOps } = await import("../src/layout.ts");
+
+  const splits: { from?: string; dir: string }[] = [];
+  const tabsMade: string[] = [];
+  let n = 1;
+  const restore = setPaneOps({
+    async splitPane(o) {
+      splits.push({ from: o.fromPaneId, dir: o.direction });
+      return `w1:p${++n}`;
+    },
+    async paneExists() {
+      return true;
+    },
+    async createTab(o) {
+      tabsMade.push(o.label ?? "");
+      return { tabId: "w1:t2", paneId: `w1:p${++n}` };
+    },
+    async closeTab() {},
+  });
+
+  resetColumns();
+  try {
+    await Promise.all(
+      [1, 2, 3, 4].map(() => createSubagentPane({ parentPaneId: "w1:p1", cwd: "/tmp" })),
+    );
+    assert.equal(
+      splits.filter((s) => s.from === "w1:p1").length,
+      0,
+      "the main pane must never be split",
+    );
+    assert.equal(tabsMade.length, 1, "one tab hosts the whole group");
+    assert.equal(splits.length, 3, "the other three stack inside that tab");
+    for (const s of splits) assert.equal(s.dir, "down");
+  } finally {
+    restore();
+    resetColumns();
+  }
+});
+
+test("the background tab closes once the last subagent finishes", async () => {
+  // Otherwise an empty "subagents" tab accumulates after every run.
+  const { createSubagentPane, releaseSubagentPane, resetColumns, setPaneOps } =
+    await import("../src/layout.ts");
+
+  const closed: string[] = [];
+  let n = 1;
+  const restore = setPaneOps({
+    async splitPane() {
+      return `w1:p${++n}`;
+    },
+    async paneExists() {
+      return true;
+    },
+    async createTab() {
+      return { tabId: "w1:t2", paneId: `w1:p${++n}` };
+    },
+    async closeTab(id) {
+      closed.push(id);
+    },
+  });
+
+  resetColumns();
+  try {
+    const a = await createSubagentPane({ parentPaneId: "w1:p1", cwd: "/tmp" });
+    const b = await createSubagentPane({ parentPaneId: "w1:p1", cwd: "/tmp" });
+
+    releaseSubagentPane("w1:p1", a);
+    assert.deepEqual(closed, [], "the tab stays while a subagent is still in it");
+
+    releaseSubagentPane("w1:p1", b);
+    await new Promise((r) => setTimeout(r, 0)); // close is fire-and-forget
+    assert.deepEqual(closed, ["w1:t2"], "the tab closes with the last subagent");
+  } finally {
+    restore();
+    resetColumns();
+  }
+});
+
+test("an unrecognised layout value gets the unobtrusive default", async () => {
+  process.env.HERDR_SUBAGENT_LAYOUT = "sidebyside-typo";
+  const { layoutMode } = await import("../src/layout.ts");
+  try {
+    assert.equal(layoutMode(), "tab", "a typo must not rearrange the screen");
+  } finally {
+    delete process.env.HERDR_SUBAGENT_LAYOUT;
+  }
 });

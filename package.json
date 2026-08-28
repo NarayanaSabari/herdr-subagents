@@ -1,6 +1,6 @@
 {
   "name": "herdr-subagents",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "Async subagents for pi, running in herdr panes",
   "keywords": [
     "pi-package",

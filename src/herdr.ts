@@ -143,6 +143,37 @@ export async function paneExists(paneId: string): Promise<boolean> {
   }
 }
 
+/**
+ * Create a tab and return its root pane.
+ *
+ * This is how subagents run without rearranging what you are looking at.
+ * Splitting the caller's pane is unavoidably visible: every spawn takes space
+ * from the pane you are reading, and four subagents leave the main view at a
+ * quarter width. A tab is a whole separate screen, so the main pane keeps its
+ * full size and the children are one keypress away instead of in the way.
+ *
+ * Always `--no-focus`: the tab is created behind you, never switched to.
+ */
+export async function createTab(opts: {
+  cwd: string;
+  label?: string;
+  env?: Record<string, string>;
+}): Promise<{ tabId: string; paneId: string }> {
+  const args = ["tab", "create", "--cwd", opts.cwd, "--no-focus"];
+  if (opts.label) args.push("--label", opts.label);
+  for (const [k, v] of Object.entries(opts.env ?? {})) args.push("--env", `${k}=${v}`);
+
+  const res = await herdr<{ tab?: { tab_id?: string }; root_pane?: PaneInfo }>(args);
+  const paneId = res?.root_pane?.pane_id;
+  if (!paneId) throw new HerdrError("tab create returned no root pane");
+  return { tabId: res?.tab?.tab_id ?? res.root_pane?.tab_id ?? "", paneId };
+}
+
+/** Close a tab, once every subagent in it has finished. */
+export async function closeTab(tabId: string): Promise<void> {
+  await herdr(["tab", "close", tabId]);
+}
+
 /** Report the pane's layout, used to decide split direction. */
 export async function paneLayout(paneId: string): Promise<unknown> {
   return herdr(["pane", "layout", "--pane", paneId]);

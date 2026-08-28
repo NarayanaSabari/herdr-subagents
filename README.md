@@ -185,6 +185,42 @@ widget above the editor shows each one:
 ╰────────────────────────────────────────────────────╯
 ```
 
+### Steering from the keyboard
+
+The widget is navigable, in the style of Claude Code's agent panel: no chord to
+learn and no mode to enter. With the editor empty, press **↓** and the
+selection lands on the first subagent.
+
+```
+╭─ Subagents ──────────────────────────── 2 running ─╮
+│ ● 00:23  scout-ops (scout)              working    │
+│›● 00:45  explore-api (explore)          working    │  <- selected
+╰────── ↑↓ select · enter open · ^X stop · esc ──────╯
+```
+
+| Key | Action |
+|-----|--------|
+| `↓` / `↑` | Move the selection. `↑` off the top leaves the panel. |
+| `Enter` | Focus that subagent's pane, so you can read it or talk to it. |
+| `Ctrl+X` | Stop it. The child unwinds, so partial output survives. |
+| `Esc` | Leave the panel. |
+
+This works *while the main agent is blocked* waiting on subagents, which is
+the moment it matters.
+
+The panel shares a keyboard with the editor, which never loses focus, so it
+gives way rather than competing:
+
+- Typing anything releases the selection, and the keystroke reaches the editor.
+  So `Ctrl+X` stops a subagent but a plain `x` types an `x`.
+- With text in the editor the panel is inert, and arrows edit the prompt.
+- `Esc` is never swallowed, and a selection you stop steering is released after
+  15 seconds, so a dialog can always be answered.
+
+Stopping a subagent this way is reported to the main agent as a deliberate
+stop, not a failure, so it will not quietly restart the work you just called
+off.
+
 `HERDR_SUBAGENT_TIMEOUT_MS` caps a single subagent (default 15 minutes) so a
 wedged child cannot hang the turn.
 

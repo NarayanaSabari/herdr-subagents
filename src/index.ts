@@ -30,12 +30,15 @@ import { adoptPiPaths, piPaths } from "./pi-paths.ts";
 import {
   closePane,
   getAgent,
+  focusAgent,
   insideHerdr,
   promptAgent,
+  sendKeys,
   startAgent,
   HerdrError,
 } from "./herdr.ts";
 import { createSubagentPane, releaseSubagentPane } from "./layout.ts";
+import { PanelState } from "./panel.ts";
 import { SubagentRegistry, type Subagent } from "./registry.ts";
 import { findSessionFile, lastAssistantMessage, truncateResult } from "./session.ts";
 import { WidgetController } from "./widget.ts";
@@ -103,6 +106,7 @@ export default async function (pi: ExtensionAPI) {
 
   const registry = new SubagentRegistry();
   const widget = new WidgetController();
+  const panel = new PanelState();
 
   /**
    * Whether a subagent left a readable result behind.
@@ -118,6 +122,134 @@ export default async function (pi: ExtensionAPI) {
   };
 
   registry.onChange(() => widget.update());
+
+  /**
+   * Bind the widget and the panel to a live UI context.
+   *
+   * Called from `session_start` and again on the first spawn: a tool call can
+   * arrive against a context the extension has not seen `session_start` for,
+   * and an unattached widget silently renders nothing.
+   */
+  function attachUI(ctx: unknown): void {
+    const host = ctx as {
+      hasUI?: boolean;
+      ui?: {
+        onTerminalInput?(h: (d: string) => unknown): () => void;
+        getEditorText?(): string;
+        notify?(m: string, t?: string): void;
+      };
+    };
+    widget.attach(
+      ctx as unknown as Parameters<typeof widget.attach>[0],
+      () => registry.all(),
+      () => panel.selection(widget.rows()),
+    );
+    // Wired here rather than only in `session_start`: a tool call can be the
+    // first thing that attaches a context, and with notify unwired every
+    // failure toast from the panel would go to the no-op default - a failed
+    // stop would be silently invisible.
+    const ui = host?.ui;
+    if (ui?.notify) {
+      notifyUI = (m, k = "info") => {
+        try {
+          ui.notify?.(m, k);
+        } catch {
+          // A missed toast must never break key handling.
+        }
+      };
+    }
+    bindKeys(host);
+  }
+
+  /** Unsubscribes the raw-input listener, so re-attaching cannot double-bind. */
+  let unbindKeys: (() => void) | undefined;
+
+  /**
+   * Claim the keys the panel needs, and only those.
+   *
+   * Everything is gated on there being a live subagent AND an empty editor, so
+   * in an ordinary session this handler passes every key straight through. The
+   * listener stays registered for the session because pi offers no way to
+   * re-register cheaply, but it is inert whenever the panel has no rows.
+   */
+  function bindKeys(host: {
+    hasUI?: boolean;
+    ui?: { onTerminalInput?(h: (d: string) => unknown): () => void; getEditorText?(): string };
+  }): void {
+    if (!host?.hasUI || !host.ui?.onTerminalInput) return;
+    // Rebind rather than skip. Skipping would leave the handler bound to a
+    // previous context's editor if `session_start` ever fires twice without an
+    // intervening shutdown, and `getEditorText()` on a dead editor could
+    // return "" forever - the panel would then steal keys from a live editor
+    // it cannot see.
+    unbindKeys?.();
+    unbindKeys = host.ui.onTerminalInput((data: string) => {
+      const rows = widget.rows();
+      // `getEditorText` is the guard that keeps arrows working while typing.
+      // If pi ever stops providing it, fail closed and take no keys at all.
+      const text = host.ui?.getEditorText?.();
+      const empty = text === "";
+      const { consume, action } = panel.handle(data, rows, empty);
+
+      if (action.kind === "open") void openSubagent(action.name);
+      else if (action.kind === "stop") void stopSubagent(action.name);
+      if (consume) widget.update();
+
+      return consume ? { consume: true } : undefined;
+    }) as () => void;
+  }
+
+  /** Enter: hand the keyboard to the child's pane. */
+  async function openSubagent(name: string): Promise<void> {
+    try {
+      await focusAgent(name);
+    } catch (err) {
+      // The pane may have closed in the moment between paint and keypress.
+      notifyUI(`Could not open ${name}: ${(err as Error).message}`, "warning");
+    }
+  }
+
+  /**
+   * `x`: stop a subagent the user no longer wants.
+   *
+   * Interrupt rather than kill the pane, so the child unwinds and flushes its
+   * session file and a partial result stays readable; closing the pane
+   * outright would race that write and lose it.
+   *
+   * The key is `esc`, not `ctrl+c`. Measured on 2026-08-28: `ctrl+c` sent to a
+   * working pi child does nothing at all - the agent stayed `working` through
+   * a full sleep - while `esc` cancels the turn immediately. Ctrl+C is pi's
+   * quit-on-empty-prompt chord, not its interrupt.
+   *
+   * `cancelled` is recorded before the key goes out so the widget stops
+   * claiming the agent is working the moment the user asks for it to stop.
+   */
+  async function stopSubagent(name: string): Promise<void> {
+    const s = registry.get(name);
+    if (!s || s.state === "finished" || s.state === "failed") return;
+    cancelled.add(name);
+    try {
+      await sendKeys(name, "esc");
+      notifyUI(`Stopped subagent ${name}`);
+      widget.update();
+    } catch (err) {
+      cancelled.delete(name);
+      notifyUI(`Could not stop ${name}: ${(err as Error).message}`, "warning");
+    }
+  }
+
+  /**
+   * Subagents the user stopped from the panel.
+   *
+   * Without this the tool result reads "finished but produced no readable
+   * result", which describes a malfunction rather than the deliberate act it
+   * was. The main agent needs to know the difference: one is worth retrying,
+   * the other means stop.
+   */
+  const cancelled = new Set<string>();
+
+  /** Best-effort toast; never throws into a key handler. */
+  let notifyUI: (msg: string, kind?: "info" | "warning" | "error") => void = () => {};
 
   /**
    * Tear down a finished subagent's pane.
@@ -197,7 +329,7 @@ export default async function (pi: ExtensionAPI) {
         );
       }
 
-      widget.attach(ctx as unknown as Parameters<typeof widget.attach>[0], () => registry.all());
+      attachUI(ctx);
 
       const name = registry.uniqueName(params.name ? slug(params.name) : def.name);
       const cwd = params.cwd ?? ctx.cwd;
@@ -293,6 +425,25 @@ export default async function (pi: ExtensionAPI) {
 
       const outcome = await Promise.race([done, timeout, aborted]);
       widget.update();
+
+      // Checked before the timeout branch: a user stop that lands inside the
+      // abort window would otherwise be reported as "did not finish within 15
+      // minutes", which is exactly the misleading-malfunction framing this
+      // feature exists to remove.
+      if (cancelled.has(name)) {
+        cancelled.delete(name);
+        const partial = registry.hasResult?.(sub)
+          ? lastAssistantMessage(findSessionFile(sessionDir, sessionId)!)
+          : undefined;
+        registry.transition(name, "failed", { error: "stopped by the user" });
+        await reclaim(sub);
+        widget.update();
+        return errorResult(
+          `Subagent ${name} was stopped by the user.` +
+            (partial ? `\n\nPartial output before it stopped:\n${truncateResult(partial)}` : "") +
+            `\n\nDo not restart it unless asked.`,
+        );
+      }
 
       if (outcome === "timeout" || outcome === "aborted") {
         const why =
@@ -454,10 +605,20 @@ export default async function (pi: ExtensionAPI) {
   registerCommands(pi, registry);
 
   pi.on("session_start", async (_e, ctx) => {
-    widget.attach(ctx as unknown as Parameters<typeof widget.attach>[0], () => registry.all());
+    attachUI(ctx);
+    const ui = (ctx as { hasUI?: boolean; ui?: { notify?(m: string, t?: string): void } }).ui;
+    if (ui?.notify) notifyUI = (m, k = "info") => {
+      try {
+        ui.notify?.(m, k);
+      } catch {
+        // A missed toast must never break key handling.
+      }
+    };
   });
 
   pi.on("session_shutdown", async () => {
+    unbindKeys?.();
+    unbindKeys = undefined;
     widget.dispose();
     registry.dispose();
   });

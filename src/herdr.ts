@@ -218,6 +218,18 @@ export async function sendKeys(target: string, keys: string): Promise<void> {
   await herdr(["agent", "send-keys", target, keys]);
 }
 
+/**
+ * Move the keyboard to a subagent's pane.
+ *
+ * The deliberate counterpart to spawning with `--no-focus`: focus is never
+ * taken from the user, only ever given when they ask for it by pressing Enter
+ * on a row. `herdr pane focus` moves by direction only, so this goes through
+ * the agent target, which addresses the pane wherever the layout put it.
+ */
+export async function focusAgent(target: string): Promise<void> {
+  await herdr(["agent", "focus", target]);
+}
+
 /** Close a pane. Only ever called on panes this extension created. */
 export async function closePane(paneId: string): Promise<void> {
   await herdr(["pane", "close", paneId]);

@@ -117,10 +117,13 @@ for, a child started with a bare `--no-extensions` loses the Anthropic
 subscription fix and dies on its first turn with
 `400 "You're out of extra usage"`.
 
-**Edit that list for your setup.** It currently points at paths under
-`~/dotfiles/.pi/agent/extensions/`. The general rule: re-add anything the child
-genuinely cannot run without, plus your safety guards - a subagent with `bash`
-should be at least as constrained as you are.
+It defaults to `~/.pi/agent/extensions/{anthropic-subscription-fix.ts,guards}`,
+pi's own extension directory, and silently skips paths that do not exist. Set
+`HERDR_SUBAGENT_EXTENSIONS` to a colon-separated list to override it.
+
+The general rule: re-add anything the child genuinely cannot run without, plus
+your safety guards - a subagent with `bash` should be at least as constrained as
+you are.
 
 ## Results
 

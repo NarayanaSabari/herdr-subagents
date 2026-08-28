@@ -12,7 +12,7 @@
  * "this agent is stuck on an approval prompt".
  */
 
-import { mkdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -38,15 +38,27 @@ import { findSessionFile, lastAssistantMessage, truncateResult } from "./session
  * `--no-extensions`.
  *
  * This is not optional polish. Measured on 2026-08-28: a child started with a
- * bare `--no-extensions` loses `anthropic-subscription-fix.ts` and dies on the
- * first turn with `400 "You're out of extra usage"`. `guards` is re-added for
- * the same reason it exists in the parent - a subagent with `bash` must not be
- * able to run `git reset --hard` unchallenged.
+ * bare `--no-extensions` loses the Anthropic subscription fix and dies on the
+ * first turn with `400 "You're out of extra usage"`. Guards are re-added for
+ * the same reason they exist in the parent - a subagent with `bash` must not
+ * be able to run `git reset --hard` unchallenged.
+ *
+ * These point at pi's own live extension directory rather than any particular
+ * dotfiles layout, so the list keeps working however those files are managed.
+ * A path that does not exist is skipped, so an unused entry is harmless.
+ *
+ * Override with `HERDR_SUBAGENT_EXTENSIONS`, a colon-separated list of paths.
  */
-const REQUIRED_EXTENSIONS = [
-  join(homedir(), "dotfiles", ".pi", "agent", "extensions", "anthropic-subscription-fix.ts"),
-  join(homedir(), "dotfiles", ".pi", "agent", "extensions", "guards"),
-];
+const PI_EXTENSIONS_DIR = join(homedir(), ".pi", "agent", "extensions");
+
+const REQUIRED_EXTENSIONS = (
+  process.env.HERDR_SUBAGENT_EXTENSIONS
+    ? process.env.HERDR_SUBAGENT_EXTENSIONS.split(":").filter(Boolean)
+    : [
+        join(PI_EXTENSIONS_DIR, "anthropic-subscription-fix.ts"),
+        join(PI_EXTENSIONS_DIR, "guards"),
+      ]
+).filter((p) => existsSync(p));
 
 /** Where child session transcripts are written, so results can be read back. */
 const SESSION_ROOT = join(homedir(), ".pi", "agent", "subagent-sessions");

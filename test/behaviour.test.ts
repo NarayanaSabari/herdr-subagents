@@ -281,3 +281,39 @@ test("widget repaints from LIVE state, not a captured snapshot", async () => {
 
   wc.dispose();
 });
+
+// ── command rendering ──────────────────────────────────────────────────────
+
+test("no rendered line can exceed the terminal width", async () => {
+  // A renderer returning an over-wide line does not clip: pi throws
+  // "Rendered line N exceeds terminal width" as an uncaught exception and
+  // exits. Crashed a live session this way before adding the wrap.
+  const { wrap } = await import("../src/commands.ts");
+
+  const cases = [
+    "short",
+    "  a normal indented description line that runs on for quite a while and then some more",
+    "  tools: read, grep, find, ls   model: anthropic/claude-sonnet-5-with-a-long-suffix",
+    "  " + "x".repeat(300), // no spaces at all: must still break
+    "/Users/someone/a/very/deep/path/that/never/contains/a/space/at/all/ever/file.ts",
+    "",
+  ];
+
+  for (const width of [20, 40, 93, 120]) {
+    for (const c of cases) {
+      for (const line of wrap(c, width)) {
+        assert.ok(
+          line.length <= width,
+          `width ${width}: produced a ${line.length}-char line: ${JSON.stringify(line.slice(0, 40))}`,
+        );
+      }
+    }
+  }
+});
+
+test("wrapping preserves the words it breaks", async () => {
+  const { wrap } = await import("../src/commands.ts");
+  const src = "  scout finds things in a codebase and reports exactly where they are";
+  const joined = wrap(src, 30).join(" ").replace(/\s+/g, " ").trim();
+  assert.equal(joined, src.replace(/\s+/g, " ").trim());
+});

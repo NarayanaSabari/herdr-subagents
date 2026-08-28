@@ -25,6 +25,7 @@ import { Type } from "typebox";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
 import { loadAgents, type AgentDef } from "./agents.ts";
+import { registerCommands } from "./commands.ts";
 import { adoptPiPaths, piPaths } from "./pi-paths.ts";
 import {
   closePane,
@@ -449,6 +450,8 @@ export default async function (pi: ExtensionAPI) {
       };
     },
   });
+
+  registerCommands(pi, registry);
 
   pi.on("session_start", async (_e, ctx) => {
     widget.attach(ctx as unknown as Parameters<typeof widget.attach>[0], () => registry.all());

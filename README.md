@@ -62,6 +62,18 @@ ln -s /path/to/herdr-subagents ~/.pi/agent/extensions/herdr-subagents
 | `subagent_status` | One subagent's state, and its output so far. |
 | `subagent_message` | Send a follow-up to a running subagent. |
 
+## Commands
+
+For you rather than the model:
+
+| command | purpose |
+|---------|---------|
+| `/subagents` | List available agents, their tool sandboxes, and anything running. |
+| `/subagent <agent> <task>` | Dispatch one yourself. Tab-completes the agent name. |
+
+`/subagents` writes to the transcript without entering LLM context, so
+inspecting your setup costs no tokens.
+
 ## Agent definitions
 
 **This package bundles no agents.** Definitions are prompts you tune over time,

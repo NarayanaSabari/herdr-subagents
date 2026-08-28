@@ -127,23 +127,32 @@ interface WidgetHost {
 /**
  * Keeps the widget in sync with the registry.
  *
- * A 1s repaint keeps the elapsed timers moving; herdr's status events only
- * fire on transitions, so event-driven repaints alone would freeze the clock.
- * The interval only runs while something is live.
+ * The controller PULLS the current agents from a supplier rather than being
+ * pushed an array. An earlier version passed the array into `setInterval`,
+ * which captured whatever the list looked like when the timer started: with
+ * three concurrent spawns the first one to land began the timer holding a
+ * one-element snapshot, and every tick afterwards repainted that stale view.
+ * Observed live as "1 running" while three subagents were working.
+ *
+ * A 1s repaint keeps the elapsed timers moving, since herdr's status events
+ * only fire on transitions. The interval runs only while something is live.
  */
 export class WidgetController {
   private timer?: ReturnType<typeof setInterval>;
   private host?: WidgetHost;
+  private supplier: () => Subagent[] = () => [];
 
-  attach(host: WidgetHost): void {
+  attach(host: WidgetHost, supplier?: () => Subagent[]): void {
     this.host = host;
+    if (supplier) this.supplier = supplier;
   }
 
-  update(agents: Subagent[]): void {
+  /** Repaint from live state. */
+  update(): void {
     const host = this.host;
     if (!host?.hasUI) return;
 
-    const lines = renderWidget(agents);
+    const lines = renderWidget(this.supplier());
     try {
       host.ui.setWidget(WIDGET_KEY, lines, { placement: "aboveEditor" });
     } catch {
@@ -151,7 +160,7 @@ export class WidgetController {
     }
 
     if (lines && !this.timer) {
-      this.timer = setInterval(() => this.update(agents), 1000);
+      this.timer = setInterval(() => this.update(), 1000);
       this.timer.unref?.();
     } else if (!lines) {
       this.stop();

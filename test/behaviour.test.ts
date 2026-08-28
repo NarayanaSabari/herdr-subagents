@@ -236,3 +236,48 @@ test("an emptied column starts fresh, splitting main again", async () => {
     resetColumns();
   }
 });
+
+// ── widget freshness ───────────────────────────────────────────────────────
+
+test("widget repaints from LIVE state, not a captured snapshot", async () => {
+  // Observed live: three subagents working, widget stuck on "1 running".
+  //
+  // The old controller took the array as an argument and passed that same
+  // array into setInterval, so the timer replayed whatever the list looked
+  // like when it started. Reproduced against that version: the widget paints
+  // "3 running", then the first tick reverts it to "1 running".
+  //
+  // The supplier must therefore be consulted on every tick, which is what
+  // this asserts - a test that only checked the paint immediately after
+  // update() passes against the buggy version too.
+  const { WidgetController } = await import("../src/widget.ts");
+
+  const registry: Subagent[] = [];
+  const all = () => [...registry]; // a fresh array each call, like registry.all()
+  let painted: string[] | undefined;
+
+  const wc = new WidgetController();
+  wc.attach(
+    { hasUI: true, ui: { setWidget: (_k: string, c: string[] | undefined) => (painted = c) } },
+    all,
+  );
+
+  registry.push(fakeSub({ name: "a", state: "working" }));
+  wc.update(); // starts the repaint timer
+
+  registry.push(fakeSub({ name: "b", paneId: "w1:p3", state: "working" }));
+  registry.push(fakeSub({ name: "c", paneId: "w1:p4", state: "working" }));
+  wc.update();
+
+  assert.match(painted?.[0] ?? "", /3 running/, "immediate paint shows all three");
+
+  await new Promise((r) => setTimeout(r, 1100));
+  assert.match(
+    painted?.[0] ?? "",
+    /3 running/,
+    "after a timer tick the widget must still show three, not a stale one",
+  );
+  assert.equal(painted?.length, 5, "top + three rows + bottom");
+
+  wc.dispose();
+});

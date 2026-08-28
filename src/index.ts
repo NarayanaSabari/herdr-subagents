@@ -112,7 +112,7 @@ export default function (pi: ExtensionAPI) {
     return Boolean(f && lastAssistantMessage(f));
   };
 
-  registry.onChange(() => widget.update(registry.all()));
+  registry.onChange(() => widget.update());
 
   /**
    * Tear down a finished subagent's pane.
@@ -185,7 +185,7 @@ export default function (pi: ExtensionAPI) {
         );
       }
 
-      widget.attach(ctx as unknown as Parameters<typeof widget.attach>[0]);
+      widget.attach(ctx as unknown as Parameters<typeof widget.attach>[0], () => registry.all());
 
       const name = registry.uniqueName(params.name ? slug(params.name) : def.name);
       const cwd = params.cwd ?? ctx.cwd;
@@ -257,7 +257,7 @@ export default function (pi: ExtensionAPI) {
         settle,
       };
       registry.add(sub);
-      widget.update(registry.all());
+      widget.update();
 
       onUpdate?.({
         content: [{ type: "text", text: `Running ${name} (${def.name}) in pane ${paneId}…\n` }],
@@ -280,7 +280,7 @@ export default function (pi: ExtensionAPI) {
       });
 
       const outcome = await Promise.race([done, timeout, aborted]);
-      widget.update(registry.all());
+      widget.update();
 
       if (outcome === "timeout" || outcome === "aborted") {
         const why =
@@ -303,7 +303,7 @@ export default function (pi: ExtensionAPI) {
       const secs = Math.round(((sub.finishedAt ?? Date.now()) - sub.startedAt) / 1000);
 
       await reclaim(sub);
-      widget.update(registry.all());
+      widget.update();
 
       if (sub.state === "failed" && !text) {
         return errorResult(`Subagent ${name} failed: ${sub.error ?? "unknown error"}`);
@@ -440,7 +440,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("session_start", async (_e, ctx) => {
-    widget.attach(ctx as unknown as Parameters<typeof widget.attach>[0]);
+    widget.attach(ctx as unknown as Parameters<typeof widget.attach>[0], () => registry.all());
   });
 
   pi.on("session_shutdown", async () => {
